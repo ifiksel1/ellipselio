@@ -36,6 +36,9 @@
 #include "common_lib.h"
 #include "imu_processing.h"
 #include "lidar_processing.h"
+#include "photometric/projector.h"
+#include "photometric/image_processing.h"
+#include "photometric/feature_manager.h"
 
 namespace ellipselio {
 
@@ -281,6 +284,19 @@ class MappingNode : public rclcpp::Node {
   CamProcessVec cams_process_;
   std::shared_ptr<ImuProcess> imu_process_;
   std::shared_ptr<LidarProcess> lid_process_;
+
+  // --- Photometric fusion (COIN-LIO LiDAR-intensity direct-photometric residual) ---
+  /// @brief Construct projector/image-processor/feature-manager from params.
+  void InitPhotometric();
+  /// @brief Build photo_frame_.points_corrected (LiDAR frame + intensity) from scan_cloud_.
+  void BuildPhotoFrame();
+  bool enable_photometric_ = false;
+  double photo_scale_ = 0.01;     ///< constant photometric row weight (v1)
+  double photo_deg_gain_ = 0.0;   ///< obs_score-modulated up-weight gain (v2; 0 = off)
+  std::shared_ptr<photometric::Projector> projector_;
+  std::shared_ptr<photometric::ImageProcessor> image_processor_;
+  std::shared_ptr<photometric::FeatureManager> feature_manager_;
+  photometric::LidarFrame photo_frame_;
 };
 }  // namespace ellipselio
 

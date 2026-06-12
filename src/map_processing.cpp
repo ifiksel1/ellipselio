@@ -885,6 +885,64 @@ void MappingNode::TensorRegistration(
   ekfom_data_h_x_.block(0, 0, feat_tot, 6) =
       ekfom_data_h_x_v_.topRows(feat_tot);
 
+  // ===================== PHOTOMETRIC RESIDUAL ROWS [feat_tot, n_tot) =====================
+  // COIN-LIO LiDAR-intensity direct-photometric residual, ported into EllipseLIO's IKFoM
+  // measurement model. Each tracked feature pixel adds a row: r = I_cur(pi(p_Li(s))) - I_ref,
+  // h_x = dI/du . du/dp . dp/d(pos,rot) (cols 0-5, matching the geometric 6-col convention).
+  // Stored at iterated state s; reprojected each IEKF iteration. h = -r matches geometric sign.
+  int n_tot = feat_tot;
+  if (enable_photometric_ && projector_ && feature_manager_ &&
+      photo_frame_.img_intensity.rows > 0) {
+    const cv::Mat& img = photo_frame_.img_intensity;
+    const auto& feats = feature_manager_->features();
+    const M3D R_IG = s.rot.conjugate().toRotationMatrix();        // world -> IMU
+    const M3D R_LI = s.offset_R_L_I.conjugate().toRotationMatrix();  // IMU -> LiDAR
+    const int border = 2;
+    const int cap = static_cast<int>(ekfom_data_h_.rows());
+    int row = feat_tot;
+    for (size_t jf = 0; jf < feats.size() && row < cap; ++jf) {
+      const photometric::Feature& f = feats[jf];
+      for (size_t l = 0; l < f.p.size() && row < cap; ++l) {
+        const V3D p_G = f.p[l];
+        const V3D p_I = s.rot.conjugate() * (p_G - s.pos);
+        const V3D p_Li = s.offset_R_L_I.conjugate() * (p_I - s.offset_T_L_I);
+        Eigen::Vector2d uv;
+        if (!projector_->projectPoint(p_Li, uv)) continue;
+        if (uv.x() < border || uv.x() > img.cols - 1 - border ||
+            uv.y() < border || uv.y() > img.rows - 1 - border)
+          continue;
+        const double I_cur = photometric::getSubPixelValue<float>(img, uv.x(), uv.y());
+        const double z_pho = I_cur - f.intensities[l];
+        Eigen::Matrix<double, 1, 2> dI_du;
+        dI_du(0, 0) = 0.5 * (photometric::getSubPixelValue<float>(img, uv.x() + 1, uv.y()) -
+                             photometric::getSubPixelValue<float>(img, uv.x() - 1, uv.y()));
+        dI_du(0, 1) = 0.5 * (photometric::getSubPixelValue<float>(img, uv.x(), uv.y() + 1) -
+                             photometric::getSubPixelValue<float>(img, uv.x(), uv.y() - 1));
+        Eigen::MatrixXd du_dp;            // 2x3
+        projector_->projectionJacobian(p_Li, du_dp);
+        Eigen::Matrix<double, 3, 6> dp_dtf;
+        dp_dtf.block<3, 3>(0, 0) = -R_LI * R_IG;            // d p_Li / d pos
+        dp_dtf.block<3, 3>(0, 3) = R_LI * SkewSymMat(p_I);  // d p_Li / d rot (right perturb)
+        const Eigen::Matrix<double, 1, 6> h_row = dI_du * du_dp * dp_dtf;
+        // Drop any non-finite photometric row (projectionJacobian divides by rxy / L*R2,
+        // which blow up for points near the sensor axis/origin). One Inf/NaN here
+        // propagates through the IEKF and poisons the whole state -> NaN trajectory.
+        if (!std::isfinite(z_pho) || !h_row.allFinite()) continue;
+        ekfom_data_h_(row) = -z_pho;
+        ekfom_data_h_x_.row(row) = h_row;
+        double w = photo_scale_;
+        if (photo_deg_gain_ > 0.0) {
+          const double deg = (1.0 - obs_min) / (1.0 - 0.1);  // obs_min in [0.1,1]
+          w *= (1.0 + photo_deg_gain_ * deg);
+        }
+        ekfom_data_w_x_(row) = w;
+        ++row;
+      }
+    }
+    n_tot = row;
+  }
+  // ======================================================================================
+
   wt_min = ekfom_data_w_.head(feat_tot).minCoeff();
   wt_max = ekfom_data_w_.head(feat_tot).maxCoeff();
   wt_mean = ekfom_data_w_.head(feat_tot).mean();
@@ -895,15 +953,16 @@ void MappingNode::TensorRegistration(
   rng_max += 1;
   rng_mean += 1;
 
-  ekfom_data_h_x_r_.leftCols(feat_tot) =
-      (ekfom_data_h_x_.topRows(feat_tot).array().colwise() *
-       ekfom_data_w_x_.head(feat_tot))
+  // h_x_R weighting now spans geometric + photometric rows (n_tot).
+  ekfom_data_h_x_r_.leftCols(n_tot) =
+      (ekfom_data_h_x_.topRows(n_tot).array().colwise() *
+       ekfom_data_w_x_.head(n_tot))
           .transpose();
 
   res_mean = -ekfom_data_h_.head(feat_tot).sum() / feat_tot;
-  ekfom_data.h = ekfom_data_h_.head(feat_tot);
-  ekfom_data.h_x = ekfom_data_h_x_.topRows(feat_tot);
-  ekfom_data.h_x_R = ekfom_data_h_x_r_.leftCols(feat_tot);
+  ekfom_data.h = ekfom_data_h_.head(n_tot);
+  ekfom_data.h_x = ekfom_data_h_x_.topRows(n_tot);
+  ekfom_data.h_x_R = ekfom_data_h_x_r_.leftCols(n_tot);
 
   ekfom_iter_cnt_++;
 
@@ -977,6 +1036,22 @@ MappingNode::MappingNode(
   this->declare_parameter<std::vector<double>>("cameras.r_cam_lidars",
                                                std::vector<double>());
 
+  // Photometric fusion params (read in InitPhotometric; declared here so YAML loads them).
+  this->declare_parameter<bool>("photometric.enable", true);
+  this->declare_parameter<double>("photometric.photo_scale", 0.01);
+  this->declare_parameter<double>("photometric.photo_deg_gain", 0.0);
+  this->declare_parameter<int>("photometric.rows", 64);
+  this->declare_parameter<int>("photometric.cols", 1024);
+  this->declare_parameter<double>("photometric.beam_offset_mm", 15.806);
+  this->declare_parameter<double>("photometric.intensity_scale", 0.25);
+  this->declare_parameter<bool>("photometric.reflectivity", false);
+  this->declare_parameter<int>("photometric.patch_size", 5);
+  this->declare_parameter<int>("photometric.num_features", 65);
+  this->declare_parameter<double>("photometric.min_range", 0.3);
+  this->declare_parameter<double>("photometric.max_range", 50.0);
+  this->declare_parameter<std::vector<double>>("photometric.beam_altitude_angles",
+                                               std::vector<double>());
+
   this->get_parameter_or<std::string>("mapping.namespace", node_namespace_, "");
   this->get_parameter_or<int>("mapping.pub_map_n_secs", pub_map_n_secs_, 10);
   this->get_parameter_or<double>("mapping.map_resolution", map_resolution_,
@@ -1040,10 +1115,14 @@ MappingNode::MappingNode(
   ekfom_data_w_ = Eigen::ArrayXd(kMaxProcPoints);
   ekfom_data_ot_ = Eigen::ArrayXXd(kMaxProcPoints, 3);
   ekfom_data_or_ = Eigen::ArrayXXd(kMaxProcPoints, 3);
-  ekfom_data_h_ = Eigen::VectorXd(kMaxProcPoints);
-  ekfom_data_w_x_ = Eigen::ArrayXd(kMaxProcPoints);
-  ekfom_data_h_x_ = Eigen::MatrixXd(kMaxProcPoints, 6);
-  ekfom_data_h_x_r_ = Eigen::MatrixXd(6, kMaxProcPoints);
+  // Final stacked buffers must hold geometric rows + appended photometric rows
+  // (num_features * patch_size^2, conservatively bounded). Working *_v_ buffers
+  // stay geometric-sized (geometric loop only touches those).
+  constexpr int kMaxPhotoRows = 4096;
+  ekfom_data_h_ = Eigen::VectorXd(kMaxProcPoints + kMaxPhotoRows);
+  ekfom_data_w_x_ = Eigen::ArrayXd(kMaxProcPoints + kMaxPhotoRows);
+  ekfom_data_h_x_ = Eigen::MatrixXd(kMaxProcPoints + kMaxPhotoRows, 6);
+  ekfom_data_h_x_r_ = Eigen::MatrixXd(6, kMaxProcPoints + kMaxPhotoRows);
   ekfom_data_h_v_ = Eigen::ArrayXd(kMaxProcPoints);
   ekfom_data_h_x_v_ = Eigen::MatrixXd(kMaxProcPoints, 6);
 
@@ -1344,6 +1423,93 @@ void MappingNode::ComputeCpuUsage() {
   analytics_msg_.cpu_usage = round(cpu_percent);
 }
 
+void MappingNode::InitPhotometric() {
+  this->get_parameter_or<bool>("photometric.enable", enable_photometric_, true);
+  this->get_parameter_or<double>("photometric.photo_scale", photo_scale_, 0.01);
+  this->get_parameter_or<double>("photometric.photo_deg_gain", photo_deg_gain_, 0.0);
+  if (!enable_photometric_) {
+    RCLCPP_INFO(this->get_logger(), "[photometric] disabled");
+    return;
+  }
+
+  int rows, cols;
+  double beam_off_mm;
+  this->get_parameter_or<int>("photometric.rows", rows, 64);
+  this->get_parameter_or<int>("photometric.cols", cols, 1024);
+  this->get_parameter_or<double>("photometric.beam_offset_mm", beam_off_mm, 15.806);
+
+  // OS1-64 beam altitude angles (deg), from 192.168.2-metadata.json. Overridable by param.
+  std::vector<double> default_alt = {
+      21.03, 20.39, 19.78, 19.14, 18.53, 17.88, 17.25, 16.59, 15.95, 15.29, 14.64,
+      13.97, 13.31, 12.63, 11.98, 11.29, 10.62, 9.94, 9.24, 8.56, 7.87, 7.17,
+      6.48, 5.79, 5.10, 4.39, 3.70, 2.98, 2.29, 1.59, 0.88, 0.18, -0.53, -1.23,
+      -1.92, -2.64, -3.34, -4.04, -4.73, -5.42, -6.12, -6.81, -7.50, -8.20, -8.89,
+      -9.58, -10.26, -10.94, -11.61, -12.28, -12.95, -13.61, -14.28, -14.94, -15.59,
+      -16.24, -16.89, -17.52, -18.17, -18.79, -19.43, -20.03, -20.65, -21.26};
+  std::vector<double> alt;
+  this->get_parameter_or<std::vector<double>>("photometric.beam_altitude_angles", alt,
+                                              default_alt);
+  if (alt.empty()) alt = default_alt;  // declared-but-unset -> use baked-in OS1-64 angles
+  if (static_cast<int>(alt.size()) != rows) {
+    RCLCPP_WARN(this->get_logger(),
+                "[photometric] beam_altitude_angles size %zu != rows %d; disabling",
+                alt.size(), rows);
+    enable_photometric_ = false;
+    return;
+  }
+
+  double intensity_scale, min_range, max_range;
+  bool reflectivity;
+  int patch_size, num_features;
+  this->get_parameter_or<double>("photometric.intensity_scale", intensity_scale, 0.25);
+  this->get_parameter_or<bool>("photometric.reflectivity", reflectivity, false);
+  this->get_parameter_or<int>("photometric.patch_size", patch_size, 5);
+  this->get_parameter_or<int>("photometric.num_features", num_features, 65);
+  this->get_parameter_or<double>("photometric.min_range", min_range, 0.3);
+  this->get_parameter_or<double>("photometric.max_range", max_range, 50.0);
+
+  projector_ = std::make_shared<photometric::Projector>(rows, cols, beam_off_mm, alt);
+
+  // v1: line-removal off (avoids needing the Ouster FIR coeffs); adaptive brightness on.
+  std::vector<int> window = {11, 11};
+  std::vector<double> hp = {1.0}, lp = {1.0};
+  image_processor_ = std::make_shared<photometric::ImageProcessor>(
+      rows, cols, min_range, max_range, patch_size, window, hp, lp, intensity_scale,
+      reflectivity, /*remove_lines=*/false, /*brightness_filter=*/true, /*blur=*/true,
+      /*erosion_margin=*/0);  // v1: no erosion (sparse splat from downsampled cloud)
+
+  // v1: "strongest" gradient feature selection (comp-mode degeneracy steering is v2).
+  feature_manager_ = std::make_shared<photometric::FeatureManager>(
+      projector_, /*margin=*/10, min_range, max_range, /*grad_min=*/20.0,
+      /*ncc_threshold=*/0.3, /*range_threshold=*/0.2, /*suppression_radius=*/10,
+      patch_size, num_features, /*max_lifetime=*/30, /*mode=*/std::string("strongest"),
+      /*debug=*/false);
+
+  RCLCPP_INFO(this->get_logger(),
+              "[photometric] enabled: %dx%d, %d feats, scale=%.4f deg_gain=%.2f", rows,
+              cols, num_features, photo_scale_, photo_deg_gain_);
+}
+
+void MappingNode::BuildPhotoFrame() {
+  if (!photo_frame_.points_corrected)
+    photo_frame_.points_corrected.reset(new photometric::PhotoCloud());
+  auto& pc = *photo_frame_.points_corrected;
+  pc.clear();
+  pc.reserve(scan_cloud_->size());
+  for (const auto& p : scan_cloud_->points) {
+    photometric::PhotoPoint q;
+    q.x = p.x;
+    q.y = p.y;
+    q.z = p.z;
+    q.intensity = p.intensity;
+    pc.push_back(q);
+  }
+  // v1: no rolling-shutter undistortion -> identity distort transform for every point,
+  // so projectUndistortedPoint() (used inside FeatureManager) returns the point unchanged.
+  photo_frame_.T_Li_Lk_vec.assign(1, photometric::M4D::Identity());
+  photo_frame_.vec_idx.assign(pc.size(), 0);
+}
+
 void MappingNode::TimerCallback() {
   if (!initialized_) {
     initialized_ = true;
@@ -1352,6 +1518,7 @@ void MappingNode::TimerCallback() {
     lid_process_ = std::make_shared<LidarProcess>(
         lidar_params_, map_resolution_, shared_from_this());
     InitCamProcess();
+    InitPhotometric();
 
     n_res_ = Eigen::ArrayXf::Ones(lidar_params_.rate);
     n_res_ *= 0.5;
@@ -1374,12 +1541,32 @@ void MappingNode::TimerCallback() {
     imu_process_->UndistortPointCloud(scan_cloud_, &kf_state_, scan_start_time_,
                                       scan_end_time_, cams_process_);
 
+    // Build the LiDAR-intensity image from the deskewed scan BEFORE the IEKF, so the
+    // photometric residual (in TensorRegistration) can project features into it.
+    if (enable_photometric_ && projector_) {
+      BuildPhotoFrame();
+      projector_->createImages(photo_frame_);
+      image_processor_->createImages(photo_frame_);
+    }
+
     t2 = omp_get_wtime();
 
     if (map_counter_) {
       ekfom_iter_cnt_ = 0;
       imu_process_->UpdateStatesWithLidar(&kf_state_, scan_end_time_,
                                           0.5 / lidar_params_.rate);
+    }
+
+    // Detect/track features on the current image (using the updated pose) for the
+    // NEXT frame's residual. Global-frame T_GL = world <- LiDAR(end).
+    if (enable_photometric_ && feature_manager_) {
+      photometric::M4D T_GL = photometric::M4D::Identity();
+      T_GL.block<3, 3>(0, 0) =
+          (kf_state_.state.rot * kf_state_.state.offset_R_L_I).toRotationMatrix();
+      T_GL.block<3, 1>(0, 3) =
+          kf_state_.state.rot * kf_state_.state.offset_T_L_I + kf_state_.state.pos;
+      static const std::vector<photometric::V3D> kNoCompDirs;  // "strongest" mode ignores V
+      feature_manager_->updateFeatures(photo_frame_, kNoCompDirs, T_GL);
     }
 
     t3 = omp_get_wtime();
