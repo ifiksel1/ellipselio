@@ -92,6 +92,11 @@ organized or an unorganized driver cloud works — points are projected individu
 returns are skipped. Beam altitude angles default to the OS1-64 values; override with
 `photometric.beam_altitude_angles` for other sensors.
 
+With `publish_debug: true` the node advertises two `sensor_msgs/Image` topics for RViz/Foxglove:
+`/photometric/intensity_image` (the processed reflectivity range-image the residual works on) and
+`/photometric/feature_image` (the same image with the currently tracked features overlaid). Both
+are published lazily (only when something subscribes).
+
 [coinliolink]: https://github.com/ethz-asl/coin-lio
 
 ## :pencil: Citation

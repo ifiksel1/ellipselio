@@ -36,7 +36,8 @@
         # v1: "strongest" feature selection, constant photo weight, no rolling-shutter undistort.
         photometric:
             enable: true
-            cloud_topic: "/ouster/points"  # ORGANIZED cloud (dense 64x1024) for the photometric image
+            cloud_topic: "/ouster/points"  # full-res cloud for the photometric image (organized or not)
+            publish_debug: true      # /photometric/intensity_image + /photometric/feature_image (view as Image)
             # Photometric Jacobian (dI/du . du/dp) has O(1e3) magnitude vs geometric O(1),
             # so in the information-form weighting (HTH = sum w*h^T h) it must be ~1e-9 to
             # balance geometric, else it dominates and diverges. Sweep on apartment bag:

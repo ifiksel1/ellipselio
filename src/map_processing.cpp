@@ -1052,6 +1052,7 @@ MappingNode::MappingNode(
   this->declare_parameter<std::vector<double>>("photometric.beam_altitude_angles",
                                                std::vector<double>());
   this->declare_parameter<std::string>("photometric.cloud_topic", "/ouster/points");
+  this->declare_parameter<bool>("photometric.publish_debug", true);
 
   this->get_parameter_or<std::string>("mapping.namespace", node_namespace_, "");
   this->get_parameter_or<int>("mapping.pub_map_n_secs", pub_map_n_secs_, 10);
@@ -1500,6 +1501,16 @@ void MappingNode::InitPhotometric() {
       std::bind(&MappingNode::OrganizedCloudCallback, this, std::placeholders::_1),
       sub_opt);
 
+  // Debug viz: the processed intensity image + tracked-feature overlay (COIN-LIO's
+  // native visualization, dropped during the port). View in Foxglove/RViz as Image.
+  this->get_parameter_or<bool>("photometric.publish_debug", publish_photo_debug_, true);
+  if (publish_photo_debug_) {
+    pub_photo_img_ = this->create_publisher<sensor_msgs::msg::Image>(
+        node_namespace_ + "/photometric/intensity_image", rclcpp::SensorDataQoS());
+    pub_photo_feat_ = this->create_publisher<sensor_msgs::msg::Image>(
+        node_namespace_ + "/photometric/feature_image", rclcpp::SensorDataQoS());
+  }
+
   RCLCPP_INFO(this->get_logger(),
               "[photometric] enabled: %dx%d, %d feats, scale=%.4f deg_gain=%.2f, cloud=%s",
               rows, cols, num_features, photo_scale_, photo_deg_gain_,
@@ -1542,6 +1553,30 @@ bool MappingNode::BuildPhotoFrame() {
   photo_frame_.T_Li_Lk_vec.assign(1, photometric::M4D::Identity());
   photo_frame_.vec_idx.assign(cloud->size(), 0);
   return true;
+}
+
+void MappingNode::PublishPhotometricDebug() {
+  if (!publish_photo_debug_ || photo_frame_.img_photo_u8.empty()) return;
+  std_msgs::msg::Header hdr;
+  hdr.stamp = scan_end_time_;
+  hdr.frame_id = "photometric";
+  // 1. Processed intensity image (the reflectivity range-image the residual works on).
+  if (pub_photo_img_ && pub_photo_img_->get_subscription_count() > 0) {
+    pub_photo_img_->publish(
+        *cv_bridge::CvImage(hdr, "mono8", photo_frame_.img_photo_u8).toImageMsg());
+  }
+  // 2. Tracked-feature overlay: green circles on each currently tracked feature.
+  if (pub_photo_feat_ && feature_manager_ &&
+      pub_photo_feat_->get_subscription_count() > 0) {
+    cv::Mat color;
+    cv::cvtColor(photo_frame_.img_photo_u8, color, cv::COLOR_GRAY2BGR);
+    for (const auto& f : feature_manager_->features()) {
+      cv::circle(color,
+                 cv::Point(static_cast<int>(f.center(0)), static_cast<int>(f.center(1))), 2,
+                 cv::Scalar(0, 255, 0), 1);
+    }
+    pub_photo_feat_->publish(*cv_bridge::CvImage(hdr, "bgr8", color).toImageMsg());
+  }
 }
 
 void MappingNode::TimerCallback() {
@@ -1602,6 +1637,7 @@ void MappingNode::TimerCallback() {
           kf_state_.state.rot * kf_state_.state.offset_T_L_I + kf_state_.state.pos;
       static const std::vector<photometric::V3D> kNoCompDirs;  // "strongest" mode ignores V
       feature_manager_->updateFeatures(photo_frame_, kNoCompDirs, T_GL);
+      PublishPhotometricDebug();
     }
 
     t3 = omp_get_wtime();

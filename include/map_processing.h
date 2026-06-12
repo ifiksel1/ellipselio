@@ -29,8 +29,14 @@
 #include <random>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#ifdef ROS_JAZZY
+  #include <cv_bridge/cv_bridge.hpp>
+#else
+  #include <cv_bridge/cv_bridge.h>
+#endif
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
@@ -294,7 +300,10 @@ class MappingNode : public rclcpp::Node {
   bool BuildPhotoFrame();
   /// @brief Buffer the organized /ouster/points (dense, NaN = no-return beam) by stamp.
   void OrganizedCloudCallback(const sensor_msgs::msg::PointCloud2::UniquePtr msg);
+  /// @brief Publish the processed intensity image + tracked-feature overlay (COIN-LIO viz).
+  void PublishPhotometricDebug();
   bool enable_photometric_ = false;
+  bool publish_photo_debug_ = true;  ///< publish /photometric/intensity_image + /feature_image
   bool photo_frame_valid_ = false;  ///< organized cloud matched this frame -> residual active
   double photo_scale_ = 1.0e-9;   ///< constant photometric row weight (v1; ~1e-9 balances geo)
   double photo_deg_gain_ = 0.0;   ///< obs_score-modulated up-weight gain (v2; 0 = off)
@@ -307,6 +316,8 @@ class MappingNode : public rclcpp::Node {
   rclcpp::CallbackGroup::SharedPtr organized_cb_group_;
   std::deque<std::pair<double, photometric::PhotoCloud::Ptr>> org_buf_;
   std::mutex org_mutex_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_photo_img_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_photo_feat_;
 };
 }  // namespace ellipselio
 
