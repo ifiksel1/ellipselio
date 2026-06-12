@@ -36,7 +36,13 @@
         # v1: "strongest" feature selection, constant photo weight, no rolling-shutter undistort.
         photometric:
             enable: true
-            photo_scale: 0.01        # constant photometric row weight (inverse-variance vs geo)
+            cloud_topic: "/ouster/points"  # ORGANIZED cloud (dense 64x1024) for the photometric image
+            # Photometric Jacobian (dI/du . du/dp) has O(1e3) magnitude vs geometric O(1),
+            # so in the information-form weighting (HTH = sum w*h^T h) it must be ~1e-9 to
+            # balance geometric, else it dominates and diverges. Sweep on apartment bag:
+            # 1e-6 -> NaN; 1e-9 -> stable (loop 0.006m); 1e-12 -> stable but ~neutral.
+            # Tune UP toward the stability boundary on a DEGENERATE scene for real benefit.
+            photo_scale: 1.0e-9      # constant photometric row weight (inverse-variance vs geo)
             photo_deg_gain: 0.0      # obs_score-modulated up-weight (v2; 0 = constant weight)
             rows: 64                 # OS1-64 beams
             cols: 1024               # intensity-image width (azimuth bins)

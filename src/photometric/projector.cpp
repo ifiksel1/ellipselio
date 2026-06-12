@@ -52,6 +52,7 @@ void Projector::createImages(LidarFrame& frame) const {
     #endif
     for (size_t j = 0; j < frame.points_corrected->points.size(); ++j) {
         const V3D p_Lk = frame.points_corrected->points[j].getVector3fMap().cast<double>();
+        if (!p_Lk.allFinite()) continue;  // organized cloud: NaN = no-return beam
         V2D px;
         if (!projectPoint(p_Lk, px)) continue;
         int u = std::round(px.x());

@@ -320,8 +320,9 @@ void FeatureManager::detectFeaturesStrong(const LidarFrame& frame, const int n_f
     features_p.reserve(n_features);
     features_uv.reserve(n_features);
     for (size_t idx = 0; idx < candidates.size(); idx++) {
-        features_uv.push_back(candidates[idx]);
         int point_idx = frame.img_idx.ptr<int>(candidates[idx].y)[candidates[idx].x];
+        if (point_idx < 0) continue;  // candidate pixel has no real point (gap)
+        features_uv.push_back(candidates[idx]);
         const auto p = frame.points_corrected->points[
             point_idx].getVector3fMap().cast<double>();
         features_p.push_back(p);
@@ -352,8 +353,9 @@ void FeatureManager::detectFeaturesRandom(const LidarFrame& frame, const int n_f
     features_p.reserve(n_features);
     features_uv.reserve(n_features);
     for (size_t idx = 0; idx < candidates.size(); idx++) {
-        features_uv.push_back(candidates[idx]);
         int point_idx = frame.img_idx.ptr<int>(candidates[idx].y)[candidates[idx].x];
+        if (point_idx < 0) continue;  // candidate pixel has no real point (gap)
+        features_uv.push_back(candidates[idx]);
         const auto p = frame.points_corrected->points[
             point_idx].getVector3fMap().cast<double>();
         features_p.push_back(p);

@@ -891,7 +891,7 @@ void MappingNode::TensorRegistration(
   // h_x = dI/du . du/dp . dp/d(pos,rot) (cols 0-5, matching the geometric 6-col convention).
   // Stored at iterated state s; reprojected each IEKF iteration. h = -r matches geometric sign.
   int n_tot = feat_tot;
-  if (enable_photometric_ && projector_ && feature_manager_ &&
+  if (photo_frame_valid_ && projector_ && feature_manager_ &&
       photo_frame_.img_intensity.rows > 0) {
     const cv::Mat& img = photo_frame_.img_intensity;
     const auto& feats = feature_manager_->features();
@@ -1038,7 +1038,7 @@ MappingNode::MappingNode(
 
   // Photometric fusion params (read in InitPhotometric; declared here so YAML loads them).
   this->declare_parameter<bool>("photometric.enable", true);
-  this->declare_parameter<double>("photometric.photo_scale", 0.01);
+  this->declare_parameter<double>("photometric.photo_scale", 1.0e-9);
   this->declare_parameter<double>("photometric.photo_deg_gain", 0.0);
   this->declare_parameter<int>("photometric.rows", 64);
   this->declare_parameter<int>("photometric.cols", 1024);
@@ -1051,6 +1051,7 @@ MappingNode::MappingNode(
   this->declare_parameter<double>("photometric.max_range", 50.0);
   this->declare_parameter<std::vector<double>>("photometric.beam_altitude_angles",
                                                std::vector<double>());
+  this->declare_parameter<std::string>("photometric.cloud_topic", "/ouster/points");
 
   this->get_parameter_or<std::string>("mapping.namespace", node_namespace_, "");
   this->get_parameter_or<int>("mapping.pub_map_n_secs", pub_map_n_secs_, 10);
@@ -1425,7 +1426,7 @@ void MappingNode::ComputeCpuUsage() {
 
 void MappingNode::InitPhotometric() {
   this->get_parameter_or<bool>("photometric.enable", enable_photometric_, true);
-  this->get_parameter_or<double>("photometric.photo_scale", photo_scale_, 0.01);
+  this->get_parameter_or<double>("photometric.photo_scale", photo_scale_, 1.0e-9);
   this->get_parameter_or<double>("photometric.photo_deg_gain", photo_deg_gain_, 0.0);
   if (!enable_photometric_) {
     RCLCPP_INFO(this->get_logger(), "[photometric] disabled");
@@ -1485,29 +1486,62 @@ void MappingNode::InitPhotometric() {
       patch_size, num_features, /*max_lifetime=*/30, /*mode=*/std::string("strongest"),
       /*debug=*/false);
 
+  // Subscribe to the ORGANIZED /ouster/points directly (dense 64x1024, NaN = no-return
+  // beam). EllipseLIO's scan_cloud_ is downsampled/NaN-filtered (~11% coverage) -> too
+  // sparse for a photometric image; the organized cloud is the dense source COIN-LIO needs.
+  this->get_parameter_or<std::string>("photometric.cloud_topic", photo_cloud_topic_,
+                                      "/ouster/points");
+  organized_cb_group_ =
+      this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  rclcpp::SubscriptionOptions sub_opt;
+  sub_opt.callback_group = organized_cb_group_;
+  sub_organized_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+      photo_cloud_topic_, rclcpp::SensorDataQoS(),
+      std::bind(&MappingNode::OrganizedCloudCallback, this, std::placeholders::_1),
+      sub_opt);
+
   RCLCPP_INFO(this->get_logger(),
-              "[photometric] enabled: %dx%d, %d feats, scale=%.4f deg_gain=%.2f", rows,
-              cols, num_features, photo_scale_, photo_deg_gain_);
+              "[photometric] enabled: %dx%d, %d feats, scale=%.4f deg_gain=%.2f, cloud=%s",
+              rows, cols, num_features, photo_scale_, photo_deg_gain_,
+              photo_cloud_topic_.c_str());
 }
 
-void MappingNode::BuildPhotoFrame() {
-  if (!photo_frame_.points_corrected)
-    photo_frame_.points_corrected.reset(new photometric::PhotoCloud());
-  auto& pc = *photo_frame_.points_corrected;
-  pc.clear();
-  pc.reserve(scan_cloud_->size());
-  for (const auto& p : scan_cloud_->points) {
-    photometric::PhotoPoint q;
-    q.x = p.x;
-    q.y = p.y;
-    q.z = p.z;
-    q.intensity = p.intensity;
-    pc.push_back(q);
+void MappingNode::OrganizedCloudCallback(
+    const sensor_msgs::msg::PointCloud2::UniquePtr msg) {
+  // Convert preserving organization (NaN points kept). fromROSMsg maps x/y/z/intensity.
+  auto cloud = std::make_shared<photometric::PhotoCloud>();
+  pcl::fromROSMsg(*msg, *cloud);
+  const double stamp = rclcpp::Time(msg->header.stamp).seconds();
+  std::lock_guard<std::mutex> lk(org_mutex_);
+  org_buf_.emplace_back(stamp, cloud);
+  while (org_buf_.size() > 20) org_buf_.pop_front();
+}
+
+bool MappingNode::BuildPhotoFrame() {
+  // Pick the organized cloud whose stamp is closest to the current scan end time.
+  const double target = scan_end_time_.seconds();
+  photometric::PhotoCloud::Ptr cloud;
+  {
+    std::lock_guard<std::mutex> lk(org_mutex_);
+    double best = 1e18;
+    for (auto& e : org_buf_) {
+      const double d = std::fabs(e.first - target);
+      if (d < best) {
+        best = d;
+        cloud = e.second;
+      }
+    }
+    if (best > 0.1) cloud.reset();  // no organized cloud within 100ms -> skip photometric
   }
-  // v1: no rolling-shutter undistortion -> identity distort transform for every point,
-  // so projectUndistortedPoint() (used inside FeatureManager) returns the point unchanged.
+  if (!cloud || cloud->empty()) return false;
+
+  // Organized cloud: dense (one entry per 64x1024 pixel), raw LiDAR frame, NaN = empty.
+  // Non-finite points are skipped in Projector::createImages. No rolling-shutter undistort
+  // in v1 -> identity distort transform so projectUndistortedPoint() is a no-op.
+  photo_frame_.points_corrected = cloud;
   photo_frame_.T_Li_Lk_vec.assign(1, photometric::M4D::Identity());
-  photo_frame_.vec_idx.assign(pc.size(), 0);
+  photo_frame_.vec_idx.assign(cloud->size(), 0);
+  return true;
 }
 
 void MappingNode::TimerCallback() {
@@ -1541,12 +1575,13 @@ void MappingNode::TimerCallback() {
     imu_process_->UndistortPointCloud(scan_cloud_, &kf_state_, scan_start_time_,
                                       scan_end_time_, cams_process_);
 
-    // Build the LiDAR-intensity image from the deskewed scan BEFORE the IEKF, so the
-    // photometric residual (in TensorRegistration) can project features into it.
-    if (enable_photometric_ && projector_) {
-      BuildPhotoFrame();
+    // Build the dense LiDAR-intensity image from the organized cloud BEFORE the IEKF, so
+    // the photometric residual (in TensorRegistration) can project features into it.
+    photo_frame_valid_ = false;
+    if (enable_photometric_ && projector_ && BuildPhotoFrame()) {
       projector_->createImages(photo_frame_);
       image_processor_->createImages(photo_frame_);
+      photo_frame_valid_ = true;
     }
 
     t2 = omp_get_wtime();
@@ -1559,7 +1594,7 @@ void MappingNode::TimerCallback() {
 
     // Detect/track features on the current image (using the updated pose) for the
     // NEXT frame's residual. Global-frame T_GL = world <- LiDAR(end).
-    if (enable_photometric_ && feature_manager_) {
+    if (photo_frame_valid_ && feature_manager_) {
       photometric::M4D T_GL = photometric::M4D::Identity();
       T_GL.block<3, 3>(0, 0) =
           (kf_state_.state.rot * kf_state_.state.offset_R_L_I).toRotationMatrix();

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <ellipselio/msg/ellipse_lio_analytics.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
@@ -286,17 +287,26 @@ class MappingNode : public rclcpp::Node {
   std::shared_ptr<LidarProcess> lid_process_;
 
   // --- Photometric fusion (COIN-LIO LiDAR-intensity direct-photometric residual) ---
-  /// @brief Construct projector/image-processor/feature-manager from params.
+  /// @brief Construct projector/image-processor/feature-manager + organized sub from params.
   void InitPhotometric();
-  /// @brief Build photo_frame_.points_corrected (LiDAR frame + intensity) from scan_cloud_.
-  void BuildPhotoFrame();
+  /// @brief Set photo_frame_.points_corrected to the organized cloud matching the current
+  ///        scan. Returns false if no organized cloud is available within tolerance.
+  bool BuildPhotoFrame();
+  /// @brief Buffer the organized /ouster/points (dense, NaN = no-return beam) by stamp.
+  void OrganizedCloudCallback(const sensor_msgs::msg::PointCloud2::UniquePtr msg);
   bool enable_photometric_ = false;
-  double photo_scale_ = 0.01;     ///< constant photometric row weight (v1)
+  bool photo_frame_valid_ = false;  ///< organized cloud matched this frame -> residual active
+  double photo_scale_ = 1.0e-9;   ///< constant photometric row weight (v1; ~1e-9 balances geo)
   double photo_deg_gain_ = 0.0;   ///< obs_score-modulated up-weight gain (v2; 0 = off)
+  std::string photo_cloud_topic_;
   std::shared_ptr<photometric::Projector> projector_;
   std::shared_ptr<photometric::ImageProcessor> image_processor_;
   std::shared_ptr<photometric::FeatureManager> feature_manager_;
   photometric::LidarFrame photo_frame_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_organized_;
+  rclcpp::CallbackGroup::SharedPtr organized_cb_group_;
+  std::deque<std::pair<double, photometric::PhotoCloud::Ptr>> org_buf_;
+  std::mutex org_mutex_;
 };
 }  // namespace ellipselio
 
