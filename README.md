@@ -73,7 +73,7 @@ Enable it with a `photometric:` block in the config (see [`config/os1_64_ouster.
 ```yaml
 photometric:
     enable: true
-    cloud_topic: "/ouster/points"   # ORGANIZED cloud (dense, NaN = no-return beam)
+    cloud_topic: "/ouster/points"   # full-resolution LiDAR cloud (NOT the downsampled internal one)
     photo_scale: 1.0e-9             # photometric row weight (see note below)
     num_features: 65
     patch_size: 5
@@ -82,13 +82,14 @@ photometric:
 | Parameter | Description |
 | --- | --- |
 | `enable` | Turn the photometric channel on/off (geometric-only when `false`) |
-| `cloud_topic` | **Organized** LiDAR cloud used to build the intensity image |
+| `cloud_topic` | Full-resolution LiDAR cloud used to build the intensity image (the raw driver cloud, not the downsampled internal one) |
 | `photo_scale` | Constant photometric row weight. The photometric Jacobian is ~O(10³) vs the geometric O(1), so in the information-form update it must be ~`1e-9` to balance — larger values let it dominate and diverge. Write it as `1.0e-9` (`1e-9` parses as a string) |
 | `num_features` / `patch_size` | Tracked features per scan and patch size |
 
-The intensity image is built from the **organized** `/ouster/points` (the internal downsampled
-cloud is too sparse), so the LiDAR driver must publish an organized cloud — e.g. run the Ouster
-driver with `organized:=true`. Beam altitude angles default to the OS1-64 values; override with
+The intensity image is built from the **full-resolution** `/ouster/points` (every valid return),
+not EllipseLIO's downsampled internal cloud, which is too sparse for a usable image. Either an
+organized or an unorganized driver cloud works — points are projected individually and empty/NaN
+returns are skipped. Beam altitude angles default to the OS1-64 values; override with
 `photometric.beam_altitude_angles` for other sensors.
 
 [coinliolink]: https://github.com/ethz-asl/coin-lio
