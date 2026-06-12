@@ -60,6 +60,39 @@ ros2 bag play --clock <imu_rate> <bag_folder> --topics <lidar_topic> <imu_topic>
 ros2 launch ellipselio ellipselio_standalone.launch.py config_file:=<config_file_name> use_sim_time:=false
 ```
 
+## Photometric fusion (COIN-LIO intensity residual)
+
+EllipseLIO can optionally fuse a **LiDAR-intensity direct-photometric residual**, ported from
+[COIN-LIO][coinliolink], into the same IKFoM update, so geometry-degenerate viewpoints (blank
+walls, smooth surfaces) are additionally constrained by reflectivity texture. Both frameworks
+share the FAST-LIO2 state manifold, so the photometric residual is stacked alongside the geometric
+one in `TensorRegistration` with no change to the state.
+
+Enable it with a `photometric:` block in the config (see [`config/os1_64_ouster.yaml`](config/os1_64_ouster.yaml)):
+
+```yaml
+photometric:
+    enable: true
+    cloud_topic: "/ouster/points"   # ORGANIZED cloud (dense, NaN = no-return beam)
+    photo_scale: 1.0e-9             # photometric row weight (see note below)
+    num_features: 65
+    patch_size: 5
+```
+
+| Parameter | Description |
+| --- | --- |
+| `enable` | Turn the photometric channel on/off (geometric-only when `false`) |
+| `cloud_topic` | **Organized** LiDAR cloud used to build the intensity image |
+| `photo_scale` | Constant photometric row weight. The photometric Jacobian is ~O(10³) vs the geometric O(1), so in the information-form update it must be ~`1e-9` to balance — larger values let it dominate and diverge. Write it as `1.0e-9` (`1e-9` parses as a string) |
+| `num_features` / `patch_size` | Tracked features per scan and patch size |
+
+The intensity image is built from the **organized** `/ouster/points` (the internal downsampled
+cloud is too sparse), so the LiDAR driver must publish an organized cloud — e.g. run the Ouster
+driver with `organized:=true`. Beam altitude angles default to the OS1-64 values; override with
+`photometric.beam_altitude_angles` for other sensors.
+
+[coinliolink]: https://github.com/ethz-asl/coin-lio
+
 ## :pencil: Citation
 
 If you use EllipseLIO please cite our preprint on [arXiv][arXivLink]
@@ -76,7 +109,7 @@ If you use EllipseLIO please cite our preprint on [arXiv][arXivLink]
 
 ## :pray: Acknowledgements
 
-Many thanks to the authors of [FAST-LIO2][fastliolink], [IKFoM][ikfomlink], and [i-Octree][ioctreelink] for open-sourcing their work, which made the development of EllipseLIO possible. 
+Many thanks to the authors of [FAST-LIO2][fastliolink], [IKFoM][ikfomlink], [i-Octree][ioctreelink], and [COIN-LIO][coinliolink] for open-sourcing their work, which made the development of EllipseLIO possible. 
 
 [fastliolink]: https://github.com/hku-mars/FAST_LIO
 [ikfomlink]: https://github.com/hku-mars/IKFoM
