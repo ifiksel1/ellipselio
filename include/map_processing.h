@@ -162,6 +162,8 @@ class MappingNode : public rclcpp::Node {
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_map_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_scan_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_effected_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_mark_;
   rclcpp::Publisher<ellipselio::msg::EllipseLioAnalytics>::SharedPtr
       pub_analytics_;
@@ -265,6 +267,11 @@ class MappingNode : public rclcpp::Node {
   EllipseLioPointCloudPtr filter_cloud_;
   EllipseLioPointCloudPtr buffer_cloud_;
   EllipseLioPointCloudPtr scan_cloud_pub_;
+  EllipseLioPointCloudPtr effected_cloud_pub_;  ///< /cloud_effected: matched points used in the EKF update
+
+  std::vector<V3F> effected_pts_;   ///< per-iteration world-frame effective points (TensorRegistration)
+  int effected_size_ = 0;           ///< number of valid effective points
+  nav_msgs::msg::Path path_msg_;    ///< accumulated /ellipselio_path
 
   iOctree::Octree ioctree_;
 

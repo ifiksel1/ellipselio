@@ -663,6 +663,31 @@ void MappingNode::PublishLidarOdometry() {
 
   pub_analytics_->publish(analytics_msg_pub_);
   PublishScan();
+
+  // /ellipselio_path: accumulate the LiDAR-rate pose (replaces odom_to_path.py).
+  geometry_msgs::msg::PoseStamped ps;
+  ps.header.frame_id = node_namespace_ + "/odom_ellipselio";
+  ps.header.stamp = kf_state_pub_.time;
+  ps.pose.position.x = kf_state_pub_.state.pos(0);
+  ps.pose.position.y = kf_state_pub_.state.pos(1);
+  ps.pose.position.z = kf_state_pub_.state.pos(2);
+  ps.pose.orientation.x = kf_state_pub_.state.rot.coeffs()[0];
+  ps.pose.orientation.y = kf_state_pub_.state.rot.coeffs()[1];
+  ps.pose.orientation.z = kf_state_pub_.state.rot.coeffs()[2];
+  ps.pose.orientation.w = kf_state_pub_.state.rot.coeffs()[3];
+  path_msg_.header = ps.header;
+  path_msg_.poses.push_back(ps);
+  if (path_msg_.poses.size() > 200000) path_msg_.poses.erase(path_msg_.poses.begin());
+  pub_path_->publish(path_msg_);
+
+  // /cloud_effected: the points that found valid map matches and drove the EKF update.
+  if (!effected_cloud_pub_->empty()) {
+    sensor_msgs::msg::PointCloud2 eff_msg;
+    pcl::toROSMsg(*effected_cloud_pub_, eff_msg);
+    eff_msg.header.frame_id = node_namespace_ + "/odom_ellipselio";
+    eff_msg.header.stamp = kf_state_pub_.time;
+    pub_effected_->publish(eff_msg);
+  }
   odom_mutex_.unlock();
 }
 
@@ -701,6 +726,8 @@ void MappingNode::TensorRegistration(
   vert_score = 1.0 - (((100.0 / mean_bin_) * grav_check) / poses_orth.norm());
 
   scan_cloud_grav_->resize(scan_cloud_->size());
+  if (effected_pts_.size() < scan_cloud_->size())
+    effected_pts_.resize(scan_cloud_->size());
   gq = Eigen::Quaternionf::FromTwoVectors(grav_norm, V3F::UnitZ());
   gq = gq * s.rot.cast<float>() * s.offset_R_L_I.cast<float>();
 
@@ -831,10 +858,12 @@ void MappingNode::TensorRegistration(
 
     ekfom_data_h_v_(feat_num - 1) = -residual;
     ekfom_data_h_x_v_.row(feat_num - 1) = h_x_vec;
+    effected_pts_[feat_num - 1] = p_world;  // world-frame effective point (/cloud_effected)
   }
 
   cnts << prim_cnts[0].load(), prim_cnts[1].load(), prim_cnts[2].load();
   feat_tot = feat_cnt.load();
+  effected_size_ = feat_tot;
   reject_cnt = scan_cloud_->size() - feat_tot;
 
   wt_min = ekfom_data_w_.head(feat_tot).minCoeff();
@@ -998,6 +1027,7 @@ MappingNode::MappingNode(
       filter_cloud_(new EllipseLioPointCloud()),
       buffer_cloud_(new EllipseLioPointCloud()),
       scan_cloud_pub_(new EllipseLioPointCloud()),
+      effected_cloud_pub_(new EllipseLioPointCloud()),
       kf_(new Ikfom()) {
   this->declare_parameter<std::string>("mapping.namespace", "");
   this->declare_parameter<int>("mapping.pub_map_n_secs", 10);
@@ -1197,6 +1227,10 @@ MappingNode::MappingNode(
       node_namespace_ + "/cloud_map", rclcpp::SensorDataQoS());
   pub_scan_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
       node_namespace_ + "/cloud_scan", rclcpp::SensorDataQoS());
+  pub_effected_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+      node_namespace_ + "/cloud_effected", rclcpp::SensorDataQoS());
+  pub_path_ = this->create_publisher<nav_msgs::msg::Path>(
+      node_namespace_ + "/ellipselio_path", rclcpp::SensorDataQoS());
   pub_mark_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
       node_namespace_ + "/visualization_marker", rclcpp::SensorDataQoS());
 
@@ -1687,6 +1721,15 @@ void MappingNode::TimerCallback() {
     kf_state_pub_ = kf_state_;
     *scan_cloud_pub_ = *scan_cloud_;
     analytics_msg_pub_ = analytics_msg_;
+    effected_cloud_pub_->clear();
+    effected_cloud_pub_->reserve(effected_size_);
+    for (int i = 0; i < effected_size_; ++i) {
+      EllipseLioPoint p;
+      p.x = effected_pts_[i](0);
+      p.y = effected_pts_[i](1);
+      p.z = effected_pts_[i](2);
+      effected_cloud_pub_->push_back(p);
+    }
     odom_mutex_.unlock();
 
     map_counter_++;
